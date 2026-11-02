@@ -12,20 +12,16 @@ const CsvFile = {
         const { rows } = await db.query(queryText, values);
         return rows[0];
     },
-    async getAll() {
-        const page = req.query.page || 10;
-        const limit = req.query.limit || 0;
-        const offset = (page - 1) * limit;
-        debugger
+    async getAll(page = 1, limit = 10, offset = 0) {
         const countQuery = 'SELECT COUNT(*) AS total FROM csv_file';
-        const [countResult] = await db.query(countQuery);
-        const totalItems = parseInt(countResult[0].total, 10);
+        const countRes = await db.query(countQuery);
+        const totalItems = parseInt(countRes.rows[0].total, 10);
 
-        const [files] = await db.query('SELECT * FROM csv_file ORDER BY id ASC LIMIT ? OFFSET ?', [limit, offset]);
-
+        const res1 = await db.query('SELECT * FROM csv_file ORDER BY id ASC LIMIT $1 OFFSET $2', [limit, offset]);
+        
         const totalPages = Math.ceil(totalItems / limit);
 
-        res.json({
+        return {
             metadata: {
                 totalItems,
                 totalPages,
@@ -34,8 +30,8 @@ const CsvFile = {
                 hasNextPage: page < totalPages,
                 hasPreviousPage: page > 1
             },
-            data: files
-        });
+            data: res1.rows
+        };
     }
 };
 

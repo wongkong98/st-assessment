@@ -1,25 +1,32 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import './App.css'
 import { Button, Modal, Upload, message, Flex, Table, Form, Input } from 'antd';
+import type { TableColumnsType, UploadFile } from 'antd';
+import type { UploadChangeParam } from 'antd/es/upload';
 import { DeleteFilled, EditFilled, InboxOutlined } from '@ant-design/icons';
-import { useEffect } from 'react';
-import axios from 'axios';
+import api from './api/client';
+import type { CsvFile, FileListResponse } from './types/csvFile';
 
 const { Dragger } = Upload;
 
+interface AddFileFormValues {
+  name: string;
+  file?: UploadFile[];
+}
+
 function App() {
-  const [addForm] = Form.useForm();
+  const [addForm] = Form.useForm<AddFileFormValues>();
 
   const [showAddModal, setShowAddModal] = useState(false);
-  const [files, setFiles] = useState([]);
+  const [files, setFiles] = useState<CsvFile[]>([]);
   const [loading, setLoading] = useState(true);
 
-  const [page, setPage] = useState(1);
-  const [limit, setLimit] = useState(10);
+  const [page] = useState(1);
+  const [limit] = useState(10);
 
   const [messageApi, contextHolder] = message.useMessage();
 
-  const columns = [
+  const columns: TableColumnsType<CsvFile> = [
     {
       title: 'id',
       dataIndex: 'id',
@@ -42,7 +49,7 @@ function App() {
     },
     {
       key: "action",
-      render: (_text, _record) => {
+      render: () => {
         return <Flex gap={10}>
           <Button icon={<EditFilled />} />
           <Button icon={<DeleteFilled style={{ color: 'red'}} />} />
@@ -51,45 +58,57 @@ function App() {
     }
   ];
 
+  const retrieveFiles = () => {
+    let ignore = false;
+
+    api.get<FileListResponse>('/file', { params: { page, limit } })
+      .then((res) => {
+        if (!ignore) setFiles(res.data.data);
+      })
+      .catch(() => {
+        if (!ignore) messageApi.error('Failed to load files.');
+      })
+      .finally(() => {
+        if (!ignore) setLoading(false);
+      });
+  }
+
   useEffect(() => {
     retrieveFiles();
-  }, []);
+  }, [page, limit]);
 
-  const retrieveFiles = async () => {
-    setLoading(true);
-    const res = await axios.get(`http://localhost:5000/api/file?page=${page}&limit=${limit}`);
-    setFiles(res.data);
-    setLoading(false);
-  };
-
-  const normFile = (e) => {
+  const normFile = (e: UploadFile[] | UploadChangeParam<UploadFile>) => {
     if (Array.isArray(e)) {
       return e;
     }
     return e?.fileList;
   };
 
-  const handleAddFile = async (values) => {
+  const handleAddFile = async (values: AddFileFormValues) => {
     const formData = new FormData();
     
     formData.append('name', values.name);
 
     if (values.file && values.file.length > 0) {
       const file = values.file[0].originFileObj;
-      formData.append('file', file);
+      if (file) {
+        formData.append('file', file);
+      }
     }
 
     try {
-      const response = await axios.post('http://localhost:5000/api/file', formData);
+      const response = await api.post('/file', formData);
       
       if (response) {
-        message.success('Upload successful!');
+        messageApi.success('Upload successful!');
         addForm.resetFields();
+        setShowAddModal(false);
+        await retrieveFiles();
       } else {
-        message.error('Upload failed.');
+        messageApi.error('Upload failed.');
       }
-    } catch (error) {
-      message.error('An error occurred during upload.');
+    } catch {
+      messageApi.error('An error occurred during upload.');
     }
   }
 
@@ -109,7 +128,6 @@ function App() {
           loading={loading}
           columns={columns}
           dataSource={files}
-          pagination={true}
         />
       </div>
 

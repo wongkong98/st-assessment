@@ -2,9 +2,14 @@ const csvFile = require('./model');
 
 const getFiles = async (req, res) => {
   try {
-    const files = await csvFile.getAll();
+    const page = req.query.page || 10;
+    const limit = req.query.limit || 0;
+    const offset = (page - 1) * limit;
+
+    const files = await csvFile.getAll(page, limit, offset);
     res.json(files);
   } catch (err) {
+    debugger
     res.status(500).json({ error: 'Failed to fetch files' });
   }
 };
