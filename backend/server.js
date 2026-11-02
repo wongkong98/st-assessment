@@ -1,14 +1,18 @@
 const express = require('express');
 const cors = require('cors');
 
+require('dotenv').config();
+const fileRoutes = require('./csvFile/routes');
+
 const app = express();
-app.use(cors());
 app.use(express.json());
 
-app.get('/api/message', (req, res) => {
-  res.json({ message: 'Hello from the Node.js backend!' });
-});
+app.use(cors({
+  origin: 'http://localhost:5173'
+}));
+app.use('/api', fileRoutes);
 
-app.listen(5000, () => {
-  console.log('Backend server running on http://localhost:5000');
+const PORT = 5000;
+app.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
 });
