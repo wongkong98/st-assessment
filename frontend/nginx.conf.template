@@ -3,7 +3,6 @@ server {
     root /usr/share/nginx/html;
     index index.html;
 
-    # Default is 1m, which would reject most CSV uploads.
     client_max_body_size 50m;
 
     location /api/ {

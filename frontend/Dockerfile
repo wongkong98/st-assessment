@@ -6,7 +6,7 @@ COPY . .
 RUN npm run build
 
 FROM nginx:alpine
-# The nginx image runs envsubst on /etc/nginx/templates/*.template at startup.
+
 ENV BACKEND_URL=http://backend:5000
 COPY nginx.conf.template /etc/nginx/templates/default.conf.template
 COPY --from=build /frontend/dist /usr/share/nginx/html
