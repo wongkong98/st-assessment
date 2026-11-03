@@ -25,6 +25,26 @@ const parseRowId = (value) => {
   return id && id <= MAX_ROW_ID ? id : null;
 };
 
+const MAX_TEXT_LENGTH = 255;
+
+const validateRowFields = ({ name, email, body, post_id }) => {
+  for (const [key, value] of Object.entries({ name, email })) {
+    if (value === undefined || value === null) continue;
+    if (typeof value !== 'string') return `${key} must be a string.`;
+    if (value.length > MAX_TEXT_LENGTH) return `${key} must be at most ${MAX_TEXT_LENGTH} characters.`;
+  }
+  if (body !== undefined && body !== null && typeof body !== 'string') {
+    return 'body must be a string.';
+  }
+  if (post_id !== undefined) {
+    const valid = typeof post_id === 'number'
+      ? Number.isSafeInteger(post_id)
+      : typeof post_id === 'string' && /^-?\d{1,15}$/.test(post_id.trim());
+    if (!valid) return 'post_id must be an integer.';
+  }
+  return null;
+};
+
 const parseDate = (value) => {
   if (!value) return null;
   const date = new Date(value);
@@ -46,8 +66,15 @@ const uploadFile = async (req, res) => {
   };
   imports.set(job.id, job);
 
-  csvFile.importCSV(req.file.path, (progress) => Object.assign(job, progress))
-    .then(({ updatedIds, changedRows }) => {
+  const force = req.body?.force === 'true';
+
+  csvFile.importCSV(req.file.path, (progress) => Object.assign(job, progress), { force })
+    .then(({ updatedIds, changedRows, concurrentChanges }) => {
+      if (concurrentChanges) {
+        job.concurrent_changes = concurrentChanges;
+        job.status = 'stale';
+        return;
+      }
       broadcastRows('rows_updated', updatedIds);
       job.changed_rows = changedRows;
       job.status = 'completed';
@@ -143,14 +170,27 @@ const editRow = async (req, res) => {
   }
 
   const fields = req.body ?? {};
-  if (fields.post_id !== undefined && !Number.isInteger(Number(fields.post_id))) {
-    return res.status(400).json({ error: 'post_id must be an integer.' });
+  const invalid = validateRowFields(fields);
+  if (invalid) {
+    return res.status(400).json({ error: invalid });
+  }
+  if (!csvFile.EDITABLE_COLUMNS.some((key) => fields[key] !== undefined)) {
+    return res.status(400).json({ error: 'Nothing to update.' });
+  }
+
+  const version = parsePositiveInt(fields.version);
+  if (!version || version > MAX_ROW_ID) {
+    return res.status(400).json({ error: 'version of the row being edited is required.' });
   }
 
   try {
-    const row = await csvFile.edit(id, fields);
+    const row = await csvFile.edit(id, version, fields);
     if (!row) {
-      return res.status(404).json({ error: 'Row not found.' });
+      const current = await csvFile.findRowById(id);
+      if (!current) {
+        return res.status(404).json({ error: 'Row not found.' });
+      }
+      return res.status(409).json({ error: 'Row was changed by someone else.', row: current });
     }
     broadcastRows('rows_updated', [row.id], req.get('X-Client-Id'));
     res.json(row);

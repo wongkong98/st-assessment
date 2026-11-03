@@ -4,7 +4,8 @@ CREATE TABLE IF NOT EXISTS csv_row (
     email         VARCHAR(255),
     body          TEXT,
     date_created  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    post_id       BIGINT NOT NULL
+    post_id       BIGINT NOT NULL,
+    version       INTEGER NOT NULL DEFAULT 1
 );
 
 CREATE TABLE IF NOT EXISTS csv_row_history (
@@ -15,6 +16,7 @@ CREATE TABLE IF NOT EXISTS csv_row_history (
     body          TEXT,
     date_created  TIMESTAMPTZ NOT NULL,
     post_id       BIGINT NOT NULL,
+    version       INTEGER NOT NULL,
     date_archived TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     CONSTRAINT fk_row_id
     FOREIGN KEY (row_id)

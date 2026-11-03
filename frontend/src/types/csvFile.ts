@@ -5,8 +5,15 @@ export interface CsvRow {
   email: string;
   body: string;
   date_created: string;
+  version: number;
   is_stale?: boolean;
   is_deleted?: boolean;
+}
+
+export interface RowFilters {
+  search?: string;
+  from?: string;
+  to?: string;
 }
 
 export interface RowHistory {
@@ -17,6 +24,7 @@ export interface RowHistory {
   email: string;
   body: string;
   date_created: string;
+  version: number;
   date_archived: string;
 }
 
@@ -41,15 +49,16 @@ export interface RowResponse {
 export interface ImportJob {
   id: string;
   name: string;
-  status: 'processing' | 'completed' | 'failed';
+  status: 'processing' | 'waiting' | 'completed' | 'failed' | 'stale';
   total_rows: number | null;
   processed_rows: number;
   error: string | null;
   changed_rows?: ChangedRow[];
+  concurrent_changes?: ChangedRow[];
 }
 
 export interface ChangedRow {
   id: number;
   old: CsvRow | null;
-  new: CsvRow;
+  new: CsvRow | null;
 }

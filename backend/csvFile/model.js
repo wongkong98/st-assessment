@@ -30,17 +30,19 @@ const upsertBatch = async (client, batch) => {
     const { rows } = await client.query(
         `WITH incoming(id, name, email, body, post_id) AS (VALUES ${placeholders.join(', ')}),
         archived AS (
-            INSERT INTO csv_row_history(row_id, name, email, body, date_created, post_id)
-            SELECT r.id, r.name, r.email, r.body, r.date_created, r.post_id
+            INSERT INTO csv_row_history(row_id, name, email, body, date_created, post_id, version)
+            SELECT r.id, r.name, r.email, r.body, r.date_created, r.post_id, r.version
             FROM csv_row r JOIN incoming i ON i.id = r.id
             WHERE (r.name, r.email, r.body, r.post_id) IS DISTINCT FROM (i.name, i.email, i.body, i.post_id)
+            FOR UPDATE OF r
             RETURNING row_id
         ),
         upserted AS (
             INSERT INTO csv_row(id, name, email, body, post_id)
             SELECT id, name, email, body, post_id FROM incoming
             ON CONFLICT (id) DO UPDATE
-            SET name = EXCLUDED.name, email = EXCLUDED.email, body = EXCLUDED.body, post_id = EXCLUDED.post_id
+            SET name = EXCLUDED.name, email = EXCLUDED.email, body = EXCLUDED.body, post_id = EXCLUDED.post_id,
+                version = csv_row.version + 1
             WHERE (csv_row.name, csv_row.email, csv_row.body, csv_row.post_id)
                 IS DISTINCT FROM (EXCLUDED.name, EXCLUDED.email, EXCLUDED.body, EXCLUDED.post_id)
         )
@@ -69,60 +71,108 @@ const buildFilters = ({ search, from, to }) => {
     return { where: conditions.length ? `WHERE ${conditions.join(' AND ')}` : '', values };
 };
 
+const selectRowsJson = 'SELECT id, to_jsonb(r) AS data FROM csv_row r WHERE id = ANY($1::integer[])';
+
+let importQueue = Promise.resolve();
+let queuedImports = 0;
+
+const runInImportQueue = (onWaiting, task) => {
+    if (queuedImports > 0) onWaiting();
+    queuedImports++;
+    const run = importQueue.then(task);
+    importQueue = run.catch(() => {});
+    return run.finally(() => {
+        queuedImports--;
+    });
+};
+
 const CsvFile = {
-    async importCSV(filePath, onProgress) {
+    EDITABLE_COLUMNS,
+    async importCSV(filePath, onProgress, { force = false } = {}) {
         let total = 0;
-        for await (const _ of parseCSV(filePath)) total++;
+        const fileIds = new Set();
+        for await (const record of parseCSV(filePath)) {
+            total++;
+            const id = Number(record.id);
+            if (Number.isInteger(id) && id > 0 && id <= MAX_ID) fileIds.add(id);
+        }
+        const ids = [...fileIds];
         onProgress({ total_rows: total, processed_rows: 0 });
 
-        const client = await db.connect();
-        
-        try {
-            await client.query('BEGIN');
-            await client.query(
-                'CREATE TEMP TABLE import_snapshot ON COMMIT DROP AS SELECT r.id, to_jsonb(r) AS data FROM csv_row r'
-            );
+        const { rows: baselineRows } = await db.query(selectRowsJson, [ids]);
+        const baseline = new Map(baselineRows.map((row) => [row.id, row.data]));
 
-            let processed = 0;
-            let batch = [];
-            let batchIds = new Set();
-            const updatedIds = new Set();
-            const flush = async () => {
-                for (const id of await upsertBatch(client, batch)) updatedIds.add(id);
-                processed += batch.length;
-                batch = [];
-                batchIds = new Set();
-                onProgress({ processed_rows: processed });
-            };
+        return runInImportQueue(() => onProgress({ status: 'waiting' }), async () => {
+            onProgress({ status: 'processing' });
+            const client = await db.connect();
 
-            for await (const record of parseCSV(filePath)) {
-                const row = toRowValues(record, processed + batch.length + 1);
-                if (batchIds.has(row[0])) await flush();
-                batch.push(row);
-                batchIds.add(row[0]);
-                if (batch.length === BATCH_SIZE) await flush();
+            try {
+                await client.query('BEGIN');
+                await client.query("SELECT pg_advisory_xact_lock(hashtext('csv_row_import'))");
+                const { rows: existingRows } = await client.query(
+                    'SELECT id FROM csv_row WHERE id = ANY($1::integer[]) FOR UPDATE',
+                    [ids]
+                );
+                const existingIds = new Set(existingRows.map((row) => row.id));
+
+                if (!force) {
+                    const { rows: currentRows } = await client.query(selectRowsJson, [ids]);
+                    const current = new Map(currentRows.map((row) => [row.id, row.data]));
+                    const concurrentChanges = ids
+                        .filter((id) => JSON.stringify(baseline.get(id) ?? null) !== JSON.stringify(current.get(id) ?? null))
+                        .sort((a, b) => a - b)
+                        .map((id) => ({ id, old: baseline.get(id) ?? null, new: current.get(id) ?? null }));
+                    if (concurrentChanges.length > 0) {
+                        await client.query('ROLLBACK');
+                        return { concurrentChanges };
+                    }
+                }
+
+                await client.query('CREATE TEMP TABLE import_snapshot (id integer, data jsonb) ON COMMIT DROP');
+                await client.query(`INSERT INTO import_snapshot ${selectRowsJson}`, [ids]);
+
+                let processed = 0;
+                let batch = [];
+                let batchIds = new Set();
+                const updatedIds = new Set();
+                const flush = async () => {
+                    for (const id of await upsertBatch(client, batch)) updatedIds.add(id);
+                    processed += batch.length;
+                    batch = [];
+                    batchIds = new Set();
+                    onProgress({ processed_rows: processed });
+                };
+
+                for await (const record of parseCSV(filePath)) {
+                    const row = toRowValues(record, processed + batch.length + 1);
+                    if (batchIds.has(row[0])) await flush();
+                    batch.push(row);
+                    batchIds.add(row[0]);
+                    if (batch.length === BATCH_SIZE) await flush();
+                }
+                if (batch.length > 0) await flush();
+
+                const { rows: changedRows } = await client.query(
+                    `SELECT (diff.data->>'id')::integer AS id, old.data AS old, diff.data AS new FROM (
+                        SELECT to_jsonb(r) AS data FROM csv_row r WHERE id = ANY($1::integer[])
+                        EXCEPT
+                        SELECT data FROM import_snapshot
+                    ) diff
+                    LEFT JOIN import_snapshot old ON old.id = (diff.data->>'id')::integer
+                    ORDER BY id`,
+                    [ids]
+                );
+
+                await client.query('COMMIT');
+                return { updatedIds: [...updatedIds].filter((id) => existingIds.has(id)), changedRows };
+            } catch (err) {
+                await client.query('ROLLBACK');
+                onProgress({ processed_rows: 0 });
+                throw err;
+            } finally {
+                client.release();
             }
-            if (batch.length > 0) await flush();
-
-            const { rows: changedRows } = await client.query(
-                `SELECT (diff.data->>'id')::integer AS id, old.data AS old, diff.data AS new FROM (
-                    SELECT to_jsonb(r) AS data FROM csv_row r
-                    EXCEPT
-                    SELECT data FROM import_snapshot
-                ) diff
-                LEFT JOIN import_snapshot old ON old.id = (diff.data->>'id')::integer
-                ORDER BY id`
-            );
-
-            await client.query('COMMIT');
-            return { updatedIds: [...updatedIds], changedRows };
-        } catch (err) {
-            await client.query('ROLLBACK');
-            onProgress({ processed_rows: 0 });
-            throw err;
-        } finally {
-            client.release();
-        }
+        });
     },
     async getAll(page, limit, filters = {}) {
         const { where, values } = buildFilters(filters);
@@ -149,15 +199,20 @@ const CsvFile = {
             data: dataRes.rows,
         };
     },
-    async edit(id, fields) {
+
+    async edit(id, version, fields) {
         const keys = EDITABLE_COLUMNS.filter((key) => fields[key] !== undefined);
-        if (keys.length === 0) {
-            return this.findRowById(id);
-        }
-        const setClause = keys.map((key, i) => `${key} = $${i + 2}`).join(', ');
+        const setClause = [...keys.map((key, i) => `${key} = $${i + 3}`), 'version = csv_row.version + 1'].join(', ');
         const { rows } = await db.query(
-            `UPDATE csv_row SET ${setClause} WHERE id = $1 RETURNING *`,
-            [id, ...keys.map((k) => fields[k])]
+            `WITH old AS (
+                SELECT * FROM csv_row WHERE id = $1 AND version = $2 FOR UPDATE
+            ),
+            archived AS (
+                INSERT INTO csv_row_history(row_id, name, email, body, date_created, post_id, version)
+                SELECT id, name, email, body, date_created, post_id, version FROM old
+            )
+            UPDATE csv_row SET ${setClause} FROM old WHERE csv_row.id = old.id RETURNING csv_row.*`,
+            [id, version, ...keys.map((k) => fields[k])]
         );
         return rows[0] || null;
     },
