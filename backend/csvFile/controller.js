@@ -1,6 +1,11 @@
 const crypto = require('crypto');
 const fs = require('fs');
 const csvFile = require('./model');
+const socket = require('../utils/socket');
+
+const broadcastRows = (type, ids, excludeClientId) => {
+  if (ids.length > 0) socket.broadcast({ type, ids }, excludeClientId);
+};
 
 const imports = new Map();
 const IMPORT_TTL_MS = 10 * 60 * 1000;
@@ -11,6 +16,13 @@ const MAX_PAGE_SIZE = 100;
 const parsePositiveInt = (value) => {
   const id = Number(value);
   return Number.isInteger(id) && id > 0 ? id : null;
+};
+
+const MAX_ROW_ID = 2147483647;
+
+const parseRowId = (value) => {
+  const id = parsePositiveInt(value);
+  return id && id <= MAX_ROW_ID ? id : null;
 };
 
 const parseDate = (value) => {
@@ -35,7 +47,9 @@ const uploadFile = async (req, res) => {
   imports.set(job.id, job);
 
   csvFile.importCSV(req.file.path, (progress) => Object.assign(job, progress))
-    .then(() => {
+    .then(({ updatedIds, changedRows }) => {
+      broadcastRows('rows_updated', updatedIds);
+      job.changed_rows = changedRows;
       job.status = 'completed';
     })
     .catch((err) => {
@@ -88,8 +102,42 @@ const getRows = async (req, res) => {
   }
 };
 
+const getRow = async (req, res) => {
+  const id = parseRowId(req.params.id);
+  if (!id) {
+    return res.status(400).json({ error: 'Invalid row id.' });
+  }
+
+  try {
+    const row = await csvFile.findRowById(id);
+    if (!row) {
+      return res.status(404).json({ error: 'Row not found.' });
+    }
+    res.json(row);
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to fetch row' });
+  }
+};
+
+const getRowHistory = async (req, res) => {
+  const id = parseRowId(req.params.id);
+  if (!id) {
+    return res.status(400).json({ error: 'Invalid row id.' });
+  }
+
+  try {
+    const [row, history] = await Promise.all([csvFile.findRowById(id), csvFile.getHistory(id)]);
+    if (!row) {
+      return res.status(404).json({ error: 'Row not found.' });
+    }
+    res.json(history);
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to fetch row history' });
+  }
+};
+
 const editRow = async (req, res) => {
-  const id = parsePositiveInt(req.params.id);
+  const id = parseRowId(req.params.id);
   if (!id) {
     return res.status(400).json({ error: 'Invalid row id.' });
   }
@@ -104,6 +152,7 @@ const editRow = async (req, res) => {
     if (!row) {
       return res.status(404).json({ error: 'Row not found.' });
     }
+    broadcastRows('rows_updated', [row.id], req.get('X-Client-Id'));
     res.json(row);
   } catch (err) {
     res.status(500).json({ error: 'Failed to update row' });
@@ -111,7 +160,7 @@ const editRow = async (req, res) => {
 };
 
 const deleteRow = async (req, res) => {
-  const id = parsePositiveInt(req.params.id);
+  const id = parseRowId(req.params.id);
   if (!id) {
     return res.status(400).json({ error: 'Invalid row id.' });
   }
@@ -121,10 +170,11 @@ const deleteRow = async (req, res) => {
     if (!row) {
       return res.status(404).json({ error: 'Row not found.' });
     }
+    broadcastRows('rows_deleted', [row.id], req.get('X-Client-Id'));
     res.status(204).end();
   } catch (err) {
     res.status(500).json({ error: 'Failed to delete row' });
   }
 };
 
-module.exports = { uploadFile, getImportProgress, getRows, editRow, deleteRow };
+module.exports = { uploadFile, getImportProgress, getRows, getRow, getRowHistory, editRow, deleteRow };

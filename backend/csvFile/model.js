@@ -27,22 +27,27 @@ const upsertBatch = async (client, batch) => {
         const p = i * 5;
         return `($${p + 1}::integer, $${p + 2}::varchar, $${p + 3}::varchar, $${p + 4}::text, $${p + 5}::bigint)`;
     });
-    await client.query(
+    const { rows } = await client.query(
         `WITH incoming(id, name, email, body, post_id) AS (VALUES ${placeholders.join(', ')}),
         archived AS (
             INSERT INTO csv_row_history(row_id, name, email, body, date_created, post_id)
             SELECT r.id, r.name, r.email, r.body, r.date_created, r.post_id
             FROM csv_row r JOIN incoming i ON i.id = r.id
             WHERE (r.name, r.email, r.body, r.post_id) IS DISTINCT FROM (i.name, i.email, i.body, i.post_id)
+            RETURNING row_id
+        ),
+        upserted AS (
+            INSERT INTO csv_row(id, name, email, body, post_id)
+            SELECT id, name, email, body, post_id FROM incoming
+            ON CONFLICT (id) DO UPDATE
+            SET name = EXCLUDED.name, email = EXCLUDED.email, body = EXCLUDED.body, post_id = EXCLUDED.post_id
+            WHERE (csv_row.name, csv_row.email, csv_row.body, csv_row.post_id)
+                IS DISTINCT FROM (EXCLUDED.name, EXCLUDED.email, EXCLUDED.body, EXCLUDED.post_id)
         )
-        INSERT INTO csv_row(id, name, email, body, post_id)
-        SELECT id, name, email, body, post_id FROM incoming
-        ON CONFLICT (id) DO UPDATE
-        SET name = EXCLUDED.name, email = EXCLUDED.email, body = EXCLUDED.body, post_id = EXCLUDED.post_id
-        WHERE (csv_row.name, csv_row.email, csv_row.body, csv_row.post_id)
-            IS DISTINCT FROM (EXCLUDED.name, EXCLUDED.email, EXCLUDED.body, EXCLUDED.post_id)`,
+        SELECT row_id FROM archived`,
         batch.flat()
     );
+    return rows.map((row) => row.row_id);
 };
 
 const buildFilters = ({ search, from, to }) => {
@@ -74,12 +79,16 @@ const CsvFile = {
         
         try {
             await client.query('BEGIN');
+            await client.query(
+                'CREATE TEMP TABLE import_snapshot ON COMMIT DROP AS SELECT r.id, to_jsonb(r) AS data FROM csv_row r'
+            );
 
             let processed = 0;
             let batch = [];
             let batchIds = new Set();
+            const updatedIds = new Set();
             const flush = async () => {
-                await upsertBatch(client, batch);
+                for (const id of await upsertBatch(client, batch)) updatedIds.add(id);
                 processed += batch.length;
                 batch = [];
                 batchIds = new Set();
@@ -95,7 +104,18 @@ const CsvFile = {
             }
             if (batch.length > 0) await flush();
 
+            const { rows: changedRows } = await client.query(
+                `SELECT (diff.data->>'id')::integer AS id, old.data AS old, diff.data AS new FROM (
+                    SELECT to_jsonb(r) AS data FROM csv_row r
+                    EXCEPT
+                    SELECT data FROM import_snapshot
+                ) diff
+                LEFT JOIN import_snapshot old ON old.id = (diff.data->>'id')::integer
+                ORDER BY id`
+            );
+
             await client.query('COMMIT');
+            return { updatedIds: [...updatedIds], changedRows };
         } catch (err) {
             await client.query('ROLLBACK');
             onProgress({ processed_rows: 0 });
@@ -148,6 +168,13 @@ const CsvFile = {
     async findRowById(id) {
         const { rows } = await db.query('SELECT * FROM csv_row WHERE id = $1', [id]);
         return rows[0] || null;
+    },
+    async getHistory(rowId) {
+        const { rows } = await db.query(
+            'SELECT * FROM csv_row_history WHERE row_id = $1 ORDER BY id DESC',
+            [rowId]
+        );
+        return rows;
     }
 };
 
